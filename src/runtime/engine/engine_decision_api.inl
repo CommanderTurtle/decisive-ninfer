@@ -11,14 +11,47 @@ std::vector<TokenId> Engine::tokenize_prompt(PromptInput input,
     return models::qwen::PreparedPromptAccess::view(prompt).token_ids;
 }
 
+BranchScorePrompt Engine::prepare_branch_prompt(PromptInput input,
+                                                const PreparationControl& control) const {
+    if (!impl_ || !impl_->options.enable_decisions)
+        throw std::logic_error("decision tokenization requires an enabled Engine");
+    auto prompt = impl_->frontend().prepare(std::move(input), control);
+    auto data   = std::make_shared<const models::qwen::PreparedPromptData>(
+        models::qwen::PreparedPromptAccess::take(std::move(prompt)));
+    BranchScorePrompt result;
+    result.tokens   = data->token_ids;
+    result.payload_ = std::move(data);
+    result.domain_  = impl_->frontend().identity();
+    return result;
+}
+
 BranchScoreResult Engine::score_branches(std::span<const BranchScoreRow> rows,
-                                         const PreparationControl& control, bool reuse_prefix) {
+                                         const PreparationControl& control, bool reuse_prefix,
+                                         const BranchScorePrompt* prompt) {
     if (!impl_ || !impl_->options.enable_decisions ||
         impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("branch scoring requires an enabled generation Engine");
     }
     if (rows.empty() || rows.size() > 65536) {
         throw std::invalid_argument("branch scoring needs 1-65536 rows");
+    }
+    std::shared_ptr<const models::qwen::PreparedPromptData> media;
+    if (prompt) {
+        const auto& frontend = impl_->frontend();
+        if (!prompt->payload_ || prompt->domain_ != frontend.identity())
+            throw std::invalid_argument("decision prompt belongs to a different Engine");
+        media = std::static_pointer_cast<const models::qwen::PreparedPromptData>(prompt->payload_);
+        if (!media->has_media() || !impl_->options.enable_vision)
+            throw std::invalid_argument("decision images require enabled Vision");
+        const auto& last = media->vision_items.back().token_spans.back();
+        const auto end   = last.begin + last.count;
+        // Every divergence follows the same complete picture. Token IDs alone cannot
+        // distinguish two pictures with identical patch geometry.
+        for (const auto& row : rows)
+            if (row.root_tokens < end || row.prefix.size() < end ||
+                !std::equal(media->token_ids.begin(), media->token_ids.begin() + end,
+                            row.prefix.begin()))
+                throw std::invalid_argument("decision image is outside the shared prompt root");
     }
     const auto vocabulary = std::visit(
         [](const auto& instance) { return instance->model->resources().public_token_count; },
@@ -42,7 +75,7 @@ BranchScoreResult Engine::score_branches(std::span<const BranchScoreRow> rows,
         validate(row.candidates);
     }
     return std::get<std::unique_ptr<Impl::GenerationCore>>(impl_->core)
-        ->score_branches(rows, control, reuse_prefix);
+        ->score_branches(rows, control, reuse_prefix, std::move(media));
 }
 
 } // namespace ninfer

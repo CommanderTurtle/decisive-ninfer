@@ -69,6 +69,8 @@ public:
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+
+    [[nodiscard]] std::shared_ptr<const void> identity() const noexcept { return impl_; }
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                         const OutputOptions& output                       = {},

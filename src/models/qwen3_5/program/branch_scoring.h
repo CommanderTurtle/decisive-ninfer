@@ -7,6 +7,7 @@
 #include "models/common/context/kv_history.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "models/common/qwen/prefix_identity.h"
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -18,7 +19,7 @@ struct BranchLayout {
     std::uint32_t prefill_chunk = 0;
     KVExecutionTableLayout tables;
     GdnReplayRecordLayout records;
-    TensorRegion ids, positions, counts, rows, slots, hidden, tails, logits;
+    TensorRegion ids, positions, rope_positions, counts, rows, slots, hidden, tails, logits;
     LayoutRegion scratch;
     std::size_t bytes = 0;
 };
@@ -33,9 +34,11 @@ struct BranchStorage {
     GdnReplayRecords records;
     ops::GdnReplayFoldPlan fold;
     context::KVHistoryStore addresses;
-    Tensor ids, positions, counts, rows, slots, hidden, tails, logits;
+    Tensor ids, positions, rope_positions, counts, rows, slots, hidden, tails, logits;
     MemoryArena work;
     std::vector<TokenId> cached_prefix;
+    qwen::ResidentPrefixIdentity picture_identity;
+    bool has_picture = false;
     std::optional<context::KVHistory> cached_address;
     StateImageStore& state_store;
     std::vector<StateImageHandle> state_handles;

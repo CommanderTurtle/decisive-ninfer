@@ -812,12 +812,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
 }
 
 void TextContext::branch_forward_batch(const Tensor& ids, const Tensor& positions,
-                                       const Tensor& counts, const Tensor& rows,
-                                       const Tensor& slots,
+                                       const Tensor& rope_positions, const Tensor& counts,
+                                       const Tensor& rows, const Tensor& slots,
                                        ops::CausalAttentionExecutionEnvelope envelope,
                                        Tensor& hidden) {
     NullTap tap;
-    target_verify_batch_impl(ids, positions, positions, counts, rows, slots, envelope, hidden,
+    target_verify_batch_impl(ids, positions, rope_positions, counts, rows, slots, envelope, hidden,
                              nullptr, nullptr, tap);
 }
 

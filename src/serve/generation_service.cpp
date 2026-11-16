@@ -335,14 +335,34 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
 }
 
 DecisionOutcome GenerationService::decide(const decision::Request& request,
-                                           std::function<bool()> is_cancelled) {
-    if (!decision_engine_) { throw std::logic_error("decision engine is disabled; start with --jev"); }
-    auto lifetime = acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, decision_capacity_);
-    // Each internal scoring submission has the Engine's normal pending timeout. An admitted
-    // multi-context decision is not killed merely because total GPU work exceeds that timeout.
+                                          std::function<bool()> is_cancelled,
+                                          std::span<const std::string> images) {
+    is_cancelled = [this, original = std::move(is_cancelled)] {
+        return !engine_->is_available() || (original && original());
+    };
+    if (!decision_engine_) throw std::logic_error("decision engine is disabled; start with --jev");
+    if (!images.empty() && !options_.enable_vision)
+        throw_invalid_input(std::invalid_argument("Vision is disabled for this server"),
+                            "vision_disabled");
+    auto lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, decision_capacity_);
+    std::vector<OwnedMedia> media;
+    auto remaining = std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+    for (const auto& source : images) {
+        ContentPart part{.kind = ContentKind::Image};
+        part.source.value = source;
+        part.source.kind  = source.starts_with("data:") ? product::media_acquire::SourceKind::Data
+                            : (source.starts_with("http://") || source.starts_with("https://"))
+                                ? product::media_acquire::SourceKind::Url
+                                : product::media_acquire::SourceKind::Path;
+        media.push_back(acquire_media(part, lifetime->deadline, is_cancelled, remaining));
+    }
     PreparationControl control{.cancellation = CancellationView(std::move(is_cancelled))};
-    auto body = decision_engine_->run(request, control);
-    return {std::move(body), std::move(lifetime)};
+    try {
+        return {decision_engine_->run(request, control, media), std::move(lifetime)};
+    } catch (const std::invalid_argument& error) {
+        throw_invalid_input(error, "invalid_decision_request");
+    }
 }
 
 std::shared_ptr<RequestLifetime>

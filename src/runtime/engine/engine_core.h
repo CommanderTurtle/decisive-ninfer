@@ -131,7 +131,8 @@ public:
     EngineCore& operator=(const EngineCore&) = delete;
 
     BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
-                                     const PreparationControl& control, bool reuse_prefix);
+                                     const PreparationControl& control, bool reuse_prefix,
+                                     std::shared_ptr<const models::qwen::PreparedPromptData> media);
 
     class Submission {
     public:

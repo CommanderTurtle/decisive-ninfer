@@ -86,8 +86,11 @@ HTTP 负责协议转换；编译器使用 artifact 模板构造 token trie，Pro
 的稳定边界评分，Host 组装 typed JSON。借用的 token span 保留到取消清理结束。
 独立队列最多等待 16 个评分事务；事务不占 generation lane，但执行期间不可抢占。
 
-决策不增加 startup reservation。临时表、ReplaySSM records、tail/logits 和 scratch
-覆盖现有 general workspace，排除仍存活的 Vision handoff 区域。布局最多容纳八行；
+纯文本决策不增加 startup reservation。启用 Vision 时，临时表、ReplaySSM records 和
+tail/logits 在 startup 规划中放在 encoder/handoff 区域之后；scratch 仍复用 general workspace。
+这样 Vision encode 不会覆盖分支元数据，原生 handoff owner/generation 仍负责跨请求失效。
+图像通过原生 multimodal prefill 进入共享 root；内容、几何及 mRoPE identity 一起控制缓存。
+图像 payload 由评分队列持有至取消清理结束，缓存仅保留 compact identity。布局最多容纳八行；
 实际 B 还受空闲 StateImage 限制，通过原生 store 租用 1+2B 个 slot。KV fork 使用
 现有 Main pool 的共享整页与尾页 COW，复制完整 convolution/recurrent state。
 无可用布局或不足三个空闲 slot 时拒绝该请求，不覆盖或回收 chat/checkpoint 状态。

@@ -246,11 +246,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
-BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch,
-                            std::uint32_t chunk, std::size_t scratch_bytes) {
+BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch, std::uint32_t chunk,
+                           std::size_t scratch_bytes, std::size_t metadata_offset = 0) {
     const auto& config = plan.profile->config.text;
     LayoutBuilder builder;
     BranchLayout b;
+    if (metadata_offset) {
+        (void)builder.add(metadata_offset, kArenaAlign, "branch native workspace");
+    }
     b.batch_capacity = batch;
     b.prefill_chunk = chunk;
     b.tables = plan_kv_execution_tables(builder, {
@@ -269,6 +272,8 @@ BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch,
     });
     b.ids = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch ids");
     b.positions = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch positions");
+    b.rope_positions =
+        add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch RoPE positions");
     b.counts = add_tensor(builder, DType::I32, {batch}, "branch lengths");
     b.rows = add_tensor(builder, DType::I32, {batch}, "branch KV rows");
     b.slots = add_tensor(builder, DType::I32, {batch}, "branch state slots");
@@ -278,7 +283,8 @@ BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch,
                          {dimension(config.hidden_size), 1 + 2 * batch}, "branch tail hidden");
     b.logits = add_tensor(builder, DType::BF16,
                           {dimension(config.vocab_size), batch}, "branch logits");
-    b.scratch = builder.add(scratch_bytes, kArenaAlign, "branch scratch");
+    b.scratch = metadata_offset ? LayoutRegion{0, scratch_bytes, kArenaAlign}
+                                : builder.add(scratch_bytes, kArenaAlign, "branch scratch");
     b.bytes = builder.finish(kArenaAlign);
     return b;
 }
@@ -760,9 +766,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
     if (plan.decision_scoring) {
-        // Fit an ephemeral decision batch into existing scratch. Never enlarge the native
-        // startup plan or use chat concurrency as the decision batch size. The general region
-        // excludes any live Vision handoff above it.
+        // Text decisions overlay existing general scratch. With Vision enabled, only branch
+        // metadata is placed beyond the native encoder/handoff; their scratch remains shared.
+        // Plan this at startup so image encoding cannot overwrite live branch tables/tails.
         std::array<std::size_t, kBranchBatch> batch_scratch{};
         std::size_t peak = 0;
         for (std::int32_t batch = 1; batch <= kBranchBatch; ++batch) {
@@ -786,6 +792,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 auto candidate = branch_layout(plan, batch, prefix_chunk,
                     std::max(batch_scratch[batch - 1], finish(prefix)));
                 if (candidate.bytes <= out.general_capacity) {
+                    if (out.vision) {
+                        candidate    = branch_layout(plan, batch, prefix_chunk,
+                                                     candidate.scratch.bytes, out.capacity);
+                        out.capacity = candidate.bytes;
+                    }
                     out.branches = std::move(candidate);
                     break;
                 }

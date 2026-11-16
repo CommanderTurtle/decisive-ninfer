@@ -100,7 +100,7 @@ Add `--jev` to the existing serving command to register `/v1/decision`, `/decisi
 and `/v1/systemone`. The normal build/Docker image contains these routes; no separate
 service or model is needed. Without the flag the routes are absent. Authentication,
 CORS, request IDs, payload bounds and disconnect handling follow the existing server.
-Responses use `Cache-Control: no-store`. These endpoints accept text, not images.
+Responses use `Cache-Control: no-store`. SystemOne also accepts images with `--vision`.
 Startup requires at least three total Device StateImages: `max-concurrency` plus extra
 `device-state-slots`. With one lane, explicitly pass `--device-state-slots 2`; `--jev`
 does not enlarge the configured capacity automatically.
@@ -151,9 +151,10 @@ options, not calibrated truth estimates. Applications own thresholds and follow-
 
 ### Execution and accounting
 
-Decisions use the resident target head, not MTP/DFlash proposal heads. Startup reservation,
-chat lanes, automatic KV sizing and graph budgets are unchanged. Temporary execution buffers
-overlay existing general workspace; free native state slots and shared KV pages bound batch
+Decisions use the resident target head, not MTP/DFlash proposal heads. Text-only startup
+reservation, chat lanes and graph budgets are unchanged. With Vision enabled, startup reserves
+branch metadata beyond the encoder/handoff workspace; both paths share the native scratch.
+Automatic KV sizing accounts for that reservation. Free native state slots and shared KV pages bound batch
 capacity. Occupied chat/checkpoint state is not evicted. Up to eight contexts and finite-trie
 divergences are compiled together; actual row batches may be smaller. This is bounded
 shared-prefix execution, not one kernel for an arbitrary request.
@@ -195,6 +196,14 @@ See [example request](../examples/decision/systemone.json).
 | `noul` | Optional true/false descriptions | `noul = P(true)`, no confidence field |
 | `choice` | 1–255 named options | Argmax choice, full probabilities, confidence |
 | `score` | 2–10 ordered levels | Unrounded probability-weighted level, legend, probabilities, confidence |
+| `box` | Optional `step` (default 0.01), `aggregate` (mode/mean/median); requires images | Normalized top/bottom/left/right, per-edge estimates, movement flags, confidence |
+
+Optional `images` accepts up to eight HTTP(S) URLs, data URLs or local filesystem paths.
+Local paths require a direct loopback client with a local Host and no Origin/forwarding headers.
+Acquisition and native Vision preprocessing use the existing media bounds and pending timeout.
+Image roots retain native content/geometry/mRoPE identity; identical patch counts alone never
+authorize reuse. Boxes expand to four isolated coordinate distributions; crossed edges are
+sorted and confidence is the least certain edge. Pair a box with a noul for presence checks.
 
 State, optional instructions and descriptions accept string/object/array/null entries.
 An array is one state, not a request batch. Requests allow 1–32 questions and 1 MiB combined

@@ -145,7 +145,8 @@ public:
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
     // Target traversal only: no proposal, sampling, or output-head projection.
-    void branch_forward_batch(const Tensor& ids, const Tensor& positions, const Tensor& counts,
+    void branch_forward_batch(const Tensor& ids, const Tensor& positions,
+                              const Tensor& rope_positions, const Tensor& counts,
                               const Tensor& rows, const Tensor& slots,
                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,

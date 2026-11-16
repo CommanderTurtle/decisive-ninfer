@@ -98,6 +98,42 @@ int test_decision_transport_capacity() {
     return failures;
 }
 
+int test_local_media_policy() {
+    httplib::Request request;
+    int failures = 0;
+    for (const auto* peer : {"127.0.0.1", "::1", "::ffff:127.0.0.1"}) {
+        request.remote_addr = peer;
+        for (const auto* host : {"localhost", "127.0.0.1:8080", "[::1]:8080"}) {
+            request.headers.clear();
+            request.set_header("Host", host);
+            failures += check(ninfer::serve::permits_local_media(request),
+                              "direct localhost client cannot name a local picture");
+        }
+    }
+    for (const auto* header : {"Origin", "Forwarded", "X-Forwarded-For", "X-Forwarded-Host"}) {
+        request.set_header(header, "untrusted");
+        failures += check(!ninfer::serve::permits_local_media(request),
+                          "browser or proxy can read server-local pictures");
+        request.headers.erase(header);
+    }
+    request.remote_addr = "192.0.2.1";
+    failures +=
+        check(!ninfer::serve::permits_local_media(request), "remote peer can read local files");
+    request.remote_addr = "127.0.0.1";
+    request.headers.clear();
+    request.set_header("Host", "localhost");
+    request.set_header("Host", "evil.example");
+    failures += check(!ninfer::serve::permits_local_media(request),
+                      "duplicate Host headers can authorize local pictures");
+    for (const auto* host : {"evil.example", "localhost.evil.example", "localhost:port", ""}) {
+        request.headers.clear();
+        request.set_header("Host", host);
+        failures += check(!ninfer::serve::permits_local_media(request),
+                          "untrusted Host can read local files");
+    }
+    return failures;
+}
+
 int test_task_queue() {
     std::atomic<unsigned> executed{0};
     auto queue = ninfer::serve::make_http_task_queue(1, 1);
@@ -326,7 +362,8 @@ int test_inherited_socket_liveness() {
 int main() {
     int failures = test_sse_transport() + test_sse_response_headers() +
                    test_prompt_json_member_order() + test_schema_number_precision() +
-                   test_decision_transport_capacity() + test_task_queue();
+                   test_decision_transport_capacity() + test_local_media_policy() +
+                   test_task_queue();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/branch_score.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 
 #include <chrono>
 #include <deque>
@@ -15,6 +16,7 @@ struct BranchScoreQueue {
     struct Job {
         std::vector<BranchScoreRow> rows;
         bool reuse_prefix = true;
+        std::shared_ptr<const models::qwen::PreparedPromptData> media;
         PreparationControl control;
         std::chrono::steady_clock::time_point pending_deadline;
         std::promise<BranchScoreResult> result;

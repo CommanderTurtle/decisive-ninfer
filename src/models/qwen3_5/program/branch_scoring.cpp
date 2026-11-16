@@ -20,10 +20,10 @@ BranchStorage::BranchStorage(MemorySpan backing, const BranchLayout& layout,
       addresses(pages, kv.execution_tables(), 1 + 2 * batch_capacity,
                 kv.execution_tables().logical_page_capacity()),
       ids(layout.ids.bind(backing)), positions(layout.positions.bind(backing)),
-      counts(layout.counts.bind(backing)), rows(layout.rows.bind(backing)),
-      slots(layout.slots.bind(backing)), hidden(layout.hidden.bind(backing)),
-      tails(layout.tails.bind(backing)), logits(layout.logits.bind(backing)),
-      work(layout.scratch.bind(backing)), state_store(store) {
+      rope_positions(layout.rope_positions.bind(backing)), counts(layout.counts.bind(backing)),
+      rows(layout.rows.bind(backing)), slots(layout.slots.bind(backing)),
+      hidden(layout.hidden.bind(backing)), tails(layout.tails.bind(backing)),
+      logits(layout.logits.bind(backing)), work(layout.scratch.bind(backing)), state_store(store) {
     if (batch_capacity < 1 || batch_capacity > layout.batch_capacity) {
         throw std::invalid_argument("decision batch exceeds its workspace layout");
     }
@@ -59,6 +59,8 @@ void BranchStorage::release_cache() {
     if (cached_address) { addresses.deactivate(cached_address->handle()); }
     cached_address.reset();
     cached_prefix.clear();
+    picture_identity.clear();
+    has_picture = false;
 }
 
 bool ProgramImpl::release_branch_cache() {
@@ -69,8 +71,8 @@ bool ProgramImpl::release_branch_cache() {
 }
 
 BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> rows,
-                                              const PreparationControl& control,
-                                              bool reuse_prefix) {
+                                              const PreparationControl& control, bool reuse_prefix,
+                                              const qwen::PreparedPromptData* picture) {
     if (!decision_scoring || has_context_operation() || pending_transaction_) {
         throw std::logic_error("branch scoring requires its enabled, stable Program boundary");
     }
@@ -89,9 +91,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
         const auto batch = std::min(workspace_plan.branches->batch_capacity,
                                     static_cast<std::int32_t>((free_states - 1) / 2));
         branches         = std::make_unique<BranchStorage>(
-            workspace_storage.span().subspan(0, workspace_plan.general_capacity),
-            *workspace_plan.branches, decoder->text_kv, *text_kv_pages, *state_images, *state_store,
-            batch, device.execution_view());
+            workspace_storage.span(), *workspace_plan.branches, decoder->text_kv, *text_kv_pages,
+            *state_images, *state_store, batch, device.execution_view());
     }
     auto& b                 = *branches;
     auto& work              = b.work;
@@ -192,7 +193,7 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
     // ReplaySSM folds only each real prefix. The saved tail is BEFORE padding, never after it.
     const auto forward = [&](std::vector<Point>& points, std::span<const BranchScoreRow> inputs,
                              std::span<const std::uint32_t> ends) {
-        std::array<std::int32_t, kBranchBatch * kBranchWidth> ids{}, positions{};
+        std::array<std::int32_t, kBranchBatch * kBranchWidth> ids{}, positions{}, rope_positions{};
         std::array<std::int32_t, kBranchBatch> lengths{}, table_rows{}, state_slots{};
         std::array<ops::GdnReplayFoldRow, kBranchBatch> folds{};
         for (;;) {
@@ -210,6 +211,7 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
             const auto count = static_cast<std::int32_t>(live.size());
             auto id_view     = b.ids.slice(1, 0, count);
             auto pos_view    = b.positions.slice(1, 0, count);
+            auto rope_view   = b.rope_positions.slice(1, 0, count);
             auto count_view  = b.counts.slice(0, 0, count);
             auto row_view    = b.rows.slice(0, 0, count);
             auto slot_view   = b.slots.slice(0, 0, count);
@@ -232,6 +234,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                     ids[r * kBranchWidth + t] = inputs[index][offset];
                     positions[r * kBranchWidth + t] =
                         static_cast<std::int32_t>(std::min<std::uint32_t>(offset, capacity - 1));
+                    rope_positions[r * kBranchWidth + t] =
+                        positions[r * kBranchWidth + t] + (picture ? picture->rope_delta : 0);
                 }
             }
             const auto upload = [&](Tensor& dst, const auto& src) {
@@ -240,13 +244,14 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
             };
             upload(id_view, ids);
             upload(pos_view, positions);
+            upload(rope_view, rope_positions);
             upload(count_view, lengths);
             upload(row_view, table_rows);
             upload(slot_view, state_slots);
             execution::TextContext card(device, parameters, work, kv, b.states, io, prefill_hidden,
                                         branch_chunk, 0, {}, nullptr, moe.get());
             card.set_gdn_state_action(execution::GdnStateAction::RecordForReplay, &b.records);
-            card.branch_forward_batch(id_view, pos_view, count_view, row_view, slot_view,
+            card.branch_forward_batch(id_view, pos_view, rope_view, count_view, row_view, slot_view,
                                       {1, capacity}, hidden_view);
             b.fold.execute(std::span(folds).first(count), device.execution_view());
             for (std::int32_t r = 0; r < count; ++r) {
@@ -269,6 +274,12 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
         }
     };
 
+    // These host control buffers outlive exception cleanup of asynchronous Vision work.
+    qwen::VisionPrefillPlan vision_plan;
+    std::unique_ptr<qwen::VisionPrefillSession> vision;
+    const auto image_end = picture ? picture->vision_items.back().token_spans.back().begin +
+                                         picture->vision_items.back().token_spans.back().count
+                                   : 0;
     try {
         check();
         // Cache policy controls prior-call reuse, not shared-prefix execution in this call.
@@ -303,7 +314,11 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                            root_tokens.begin();
             root_tokens  = root_tokens.first(n);
         }
-        if (b.cached_address && !std::ranges::equal(root_tokens, b.cached_prefix)) {
+        qwen::ResidentPrefixIdentity picture_identity;
+        if (picture) picture_identity.assign(*picture);
+        if (b.cached_address && (!std::ranges::equal(root_tokens, b.cached_prefix) ||
+                                 b.has_picture != (picture != nullptr) ||
+                                 (picture && !b.picture_identity.equals(picture_identity)))) {
             b.release_cache();
         }
         const auto reusable_pages  = b.cached_address ? pages_for(b.cached_prefix.size()) : 0;
@@ -318,6 +333,10 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                 fits &= pages_for(root_tokens.size()) + trunk_pages + leaf_pages <= budget;
             }
             if (!fits) {
+                if (picture) {
+                    throw RequestError(RequestErrorKind::Overloaded,
+                                       "decision image root exceeds available shared KV capacity");
+                }
                 // Reuse is optional. Near capacity, score from an empty root instead of
                 // requiring spare COW pages beside a full-length predictor. The token input
                 // and probability calculation are unchanged; only prefill reuse is lost.
@@ -338,10 +357,32 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
             root = create(static_cast<std::uint32_t>(root_tokens.size()), 0, 0);
         }
         b.cached_prefix.clear();
+        if (picture && root.frontier < root_tokens.size()) {
+            if (!workspace_plan.vision || !parameters.vision) {
+                throw RequestError(RequestErrorKind::Unavailable, "decision Vision is unavailable");
+            }
+            vision_plan.control_plan = std::make_shared<qwen::VisionControlPlan>(
+                qwen::plan_vision_control(*picture, *parameters.model.config().vision));
+            vision_plan.control = std::make_shared<qwen::VisionControl>(
+                qwen::build_vision_control(*picture, *vision_plan.control_plan, 0));
+            for (std::size_t i = 0; i < vision_plan.control_plan->items.size(); ++i) {
+                const auto& item = vision_plan.control_plan->items[i];
+                vision_plan.uses.push_back({item.token_begin, item.token_end,
+                                            static_cast<std::uint32_t>(i),
+                                            static_cast<std::uint32_t>(i)});
+                vision_plan.max_merged_count =
+                    std::max(vision_plan.max_merged_count, item.merged_count);
+            }
+            vision = std::make_unique<qwen::VisionPrefillSession>(
+                device, *parameters.model.config().vision, *parameters.vision,
+                workspace_storage.span(), *workspace_plan.vision, *picture, vision_plan,
+                vision_handoff, vision_handoff_peak_bytes);
+        }
         while (root.frontier < root_tokens.size()) {
             check();
-            const auto length =
-                std::min<std::uint32_t>(branch_chunk, root_tokens.size() - root.frontier);
+            auto length = std::min<std::uint32_t>(branch_chunk, root_tokens.size() - root.frontier);
+            const bool visual = picture && root.frontier < image_end;
+            if (visual) { length = std::min<std::uint32_t>(length, image_end - root.frontier); }
             auto& history = owner(root.address);
             b.addresses.prepare_write(history, root.frontier, root.frontier + length,
                                       device.stream());
@@ -358,9 +399,12 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                                             .sampling                  = nullptr,
                                             .rewrite_checkpoint_hidden = nullptr,
                                             .state_source_slot         = b.state_slot(0),
-                                            .state_destination_slot    = b.state_slot(0)};
-            const auto step =
-                execution::prefill_text_chunk(state, root_tokens, length, std::nullopt, false);
+                                            .state_destination_slot    = b.state_slot(0),
+                                            .rope_delta = picture ? picture->rope_delta : 0};
+            const auto step = visual ? execution::prefill_multimodal_chunk(
+                                           state, *picture, *vision, length, std::nullopt, false)
+                                     : execution::prefill_text_chunk(state, root_tokens, length,
+                                                                     std::nullopt, false);
             if (!step.processed_tokens) {
                 throw std::logic_error("branch prefix made no progress");
             }
@@ -495,6 +539,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
         }
         if (!root_tokens.empty()) {
             b.cached_prefix.assign(root_tokens.begin(), root_tokens.end());
+            b.picture_identity = std::move(picture_identity);
+            b.has_picture      = picture != nullptr;
             auto it = std::find_if(owned.begin(), owned.end(), [&](const auto& history) {
                 return history.handle() == root.address;
             });
