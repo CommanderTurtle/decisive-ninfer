@@ -50,6 +50,7 @@ using qwen3_5::WeightUseId;
 struct HyperConnectionWeights {
     WeightId norm, down, up;
     std::optional<WeightId> inject; // absent for the final mixer
+    std::optional<WeightId> prefill_inject; // distinct original operand, when stored
 };
 
 struct SparseAttentionWeights {

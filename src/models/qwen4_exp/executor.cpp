@@ -287,9 +287,13 @@ qwen3_5::execution::VisionParameters vision_parameters_for(const Model& model,
 
 struct HcPlan {
     Tensor norm;
-    ops::HyperConnectionMatrix down, up, inject;
+    ops::HyperConnectionMatrix down, up, inject, prefill_inject;
+    bool unit_offset = true;
 
-    [[nodiscard]] ops::HyperConnectionWeights weights() const { return {&norm, down, up, inject}; }
+    [[nodiscard]] ops::HyperConnectionWeights weights(bool prefill = false) const {
+        return {&norm, down, up, prefill && prefill_inject.data ? prefill_inject : inject,
+                unit_offset};
+    }
 };
 
 // A hyper-connection matrix as stored: ggml Q8_0 blocks, or BF16 words.
@@ -306,11 +310,16 @@ HcPlan make_hc(const Model& model, const HyperConnectionWeights& w, const TextCo
     const auto width = static_cast<std::int32_t>(c.hc_count * c.hidden_size);
     const auto low   = static_cast<std::int32_t>(c.hc_lowrank);
     HcPlan out;
-    out.norm = direct(model, w.norm, {width});
+    out.norm        = direct(model, w.norm, {width}, c.fp32_direct ? DType::FP32 : DType::BF16);
+    out.unit_offset = c.norm_unit_offset;
     out.down = hc_matrix(model, w.down, {width, low});
     out.up   = hc_matrix(model, w.up, {low, width});
     if (w.inject) {
         out.inject = hc_matrix(model, *w.inject, {width, static_cast<std::int32_t>(c.hc_count)});
+    }
+    if (w.prefill_inject) {
+        out.prefill_inject =
+            hc_matrix(model, *w.prefill_inject, {width, static_cast<std::int32_t>(c.hc_count)});
     }
     return out;
 }
@@ -929,6 +938,12 @@ struct Executor::Impl {
     // A pass of `forward`: a prompt chunk, whose tensor-parallel exchanges take the prompt
     // partials (ExecutorOptions::tensor_parallel_prompt_partials).
     bool prompt_pass = false;
+
+    [[nodiscard]] DType scalar_dtype() const {
+        return config.fp32_direct ? DType::FP32 : DType::BF16;
+    }
+
+    [[nodiscard]] bool prompt_weights() const { return prompt_pass || branch_origin != nullptr; }
     // A prompt pass that leaves no logits and whose final stacks nothing reads (kv_only_allowed):
     // its last layer, a sparse-attention one, runs only what the sequence keeps -- the KV append
     // and the indexer's append -- and neither its attention, its experts nor the head run.
@@ -1503,9 +1518,9 @@ struct Executor::Impl {
         RankBinding bind(device, model.head_rank());
         const auto h = static_cast<std::int32_t>(config.hidden_size);
         MtpPlan plan;
-        plan.embedding_norm = direct(model, w.embedding_norm, {h});
-        plan.hidden_norm =
-            direct(model, w.hidden_norm, {static_cast<std::int32_t>(config.hc_count) * h});
+        plan.embedding_norm = direct(model, w.embedding_norm, {h}, scalar_dtype());
+        plan.hidden_norm = direct(model, w.hidden_norm,
+                                  {static_cast<std::int32_t>(config.hc_count) * h}, scalar_dtype());
         plan.fc_embedding = make_projection(model, {w.fc_embedding});
         plan.fc_hidden    = make_projection(model, {w.fc_hidden});
         const auto& weights = model.weights();
@@ -1621,11 +1636,13 @@ struct Executor::Impl {
             const auto channels = static_cast<std::int32_t>(gdn.qkv.rows);
             gdn.convolution =
                 direct(model, g->convolution,
-                       {channels, static_cast<std::int32_t>(config.linear_conv_kernel_dim)});
+                       {channels, static_cast<std::int32_t>(config.linear_conv_kernel_dim)},
+                       scalar_dtype());
             gdn.a_log   = direct(model, g->a_log, {gdn.value_heads}, DType::FP32);
             gdn.dt_bias = direct(model, g->dt_bias, {gdn.value_heads}, DType::FP32);
             gdn.norm =
-                direct(model, g->norm, {static_cast<std::int32_t>(config.linear_value_head_dim)});
+                direct(model, g->norm, {static_cast<std::int32_t>(config.linear_value_head_dim)},
+                       scalar_dtype());
             plan.gdn = std::move(gdn);
         } else if (const auto* sparse = std::get_if<SparseAttentionWeights>(&lw.mixer)) {
             const auto& a = *sparse;
@@ -1641,10 +1658,10 @@ struct Executor::Impl {
             qsa.output           = make_projection(model, {a.output});
             const auto d         = static_cast<std::int32_t>(config.head_dim);
             const auto di        = static_cast<std::int32_t>(config.indexer_head_dim);
-            qsa.query_norm       = direct(model, a.query_norm, {d});
-            qsa.key_norm         = direct(model, a.key_norm, {d});
-            qsa.index_query_norm = direct(model, a.index_query_norm, {di});
-            qsa.index_key_norm   = direct(model, a.index_key_norm, {di});
+            qsa.query_norm       = direct(model, a.query_norm, {d}, scalar_dtype());
+            qsa.key_norm         = direct(model, a.key_norm, {d}, scalar_dtype());
+            qsa.index_query_norm = direct(model, a.index_query_norm, {di}, scalar_dtype());
+            qsa.index_key_norm   = direct(model, a.index_key_norm, {di}, scalar_dtype());
             plan.qsa             = std::move(qsa);
         }
         // Without the n-gram table the injection adds nothing (an all-zero embedding projects
@@ -1654,12 +1671,12 @@ struct Executor::Impl {
             ple.key          = make_projection(model, {lw.ple->key});
             ple.value        = make_projection(model, {lw.ple->value});
             const auto width = static_cast<std::int32_t>(config.hc_count * config.hidden_size);
-            ple.norm_key     = direct(model, lw.ple->norm_key, {width});
-            ple.norm_query   = direct(model, lw.ple->norm_query, {width});
-            ple.norm_conv    = direct(model, lw.ple->norm_conv, {width});
-            ple.convolution =
-                direct(model, lw.ple->convolution,
-                       {static_cast<std::int32_t>(config.ple_conv_kernel_size), width});
+            ple.norm_key     = direct(model, lw.ple->norm_key, {width}, scalar_dtype());
+            ple.norm_query   = direct(model, lw.ple->norm_query, {width}, scalar_dtype());
+            ple.norm_conv    = direct(model, lw.ple->norm_conv, {width}, scalar_dtype());
+            ple.convolution  = direct(
+                model, lw.ple->convolution,
+                {static_cast<std::int32_t>(config.ple_conv_kernel_size), width}, scalar_dtype());
             plan.ple = std::move(ple);
         }
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
@@ -3642,7 +3659,7 @@ struct Executor::Impl {
             gb(columns(p.b, nv, span.column, 2), DType::BF16, {nv, span.count});
         Tensor gate(p.gate + at, DType::FP32, {nv, span.count}),
             beta(p.beta + at, DType::FP32, {nv, span.count});
-        ops::gdn_gating(ga, gb, g.a_log, g.dt_bias, gate, beta, s);
+        ops::gdn_gating(ga, gb, g.a_log, g.dt_bias, gate, beta, s, config.gdn_a_is_log);
     }
 
     void gdn_part(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
@@ -3844,7 +3861,7 @@ struct Executor::Impl {
         const ops::RopeYarn& yarn = options.rope_yarn;
         // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
         const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
-        if (mrope || yarn.active() || share) {
+        if (mrope || yarn.active() || share || config.fp32_direct || !config.norm_unit_offset) {
             // A media prompt: the three-axis positions of its images and video, each pair of
             // rotated dimensions on axis i % 3 (the interleaved MRoPE sections). Under YaRN, text
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
@@ -3853,8 +3870,8 @@ struct Executor::Impl {
             const Tensor line(const_cast<std::int32_t*>(rope) + span.column, DType::I32,
                               {span.count});
             const int rotary = static_cast<int>(float(d) * config.partial_rotary_factor);
-            ops::rmsnorm(q3, a.query_norm, config.rms_norm_eps, true, qo, s);
-            ops::rmsnorm(k3, a.key_norm, config.rms_norm_eps, true, ko, s);
+            ops::rmsnorm(q3, a.query_norm, config.rms_norm_eps, config.norm_unit_offset, qo, s);
+            ops::rmsnorm(k3, a.key_norm, config.rms_norm_eps, config.norm_unit_offset, ko, s);
             if (yarn.active()) {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, qo, s);
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, ko, s);
@@ -3906,7 +3923,8 @@ struct Executor::Impl {
         Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
         Tensor tail(in.tail, DType::FP32,
                     {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
-        const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+        const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm,
+                                        config.norm_unit_offset};
         // The call's first position is the part's first staged one, read on the device.
         const Tensor first(part_positions, DType::I32, {1});
         if (kv_only) {
@@ -4061,7 +4079,7 @@ struct Executor::Impl {
                        {width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
                                                          config.ngram.ngram_size)});
         const ops::PleInjectWeights weights{&p.norm_key, &p.norm_query, &p.norm_conv,
-                                            &p.convolution};
+                                            &p.convolution, config.norm_unit_offset};
         auto scope = ws.scope();
         if (verifying) {
             // The history stays; commit() advances it over the kept positions' recorded input.
@@ -4418,12 +4436,13 @@ struct Executor::Impl {
             {
                 auto scope = rank.workspace->scope();
                 if (pending) {
-                    ops::hyper_connection_write_read(stack, moe_out, inject, plan.attn_hc.weights(),
-                                                     config.rms_norm_eps, *rank.workspace, mixed,
-                                                     &inject, rank.stream);
+                    ops::hyper_connection_write_read(
+                        stack, moe_out, inject, plan.attn_hc.weights(prompt_weights()),
+                        config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
                 } else {
-                    ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
-                                               *rank.workspace, mixed, &inject, rank.stream);
+                    ops::hyper_connection_read(stack, plan.attn_hc.weights(prompt_weights()),
+                                               config.rms_norm_eps, *rank.workspace, mixed, &inject,
+                                               rank.stream);
                 }
                 pending = false;
             }
@@ -4435,9 +4454,10 @@ struct Executor::Impl {
             if (kv_only) { break; }
             {
                 auto scope = rank.workspace->scope();
-                ops::hyper_connection_write_read(
-                    stack, Tensor(rank.y, DType::BF16, {h, t}), inject, plan.mlp_hc.weights(),
-                    config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
+                ops::hyper_connection_write_read(stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
+                                                 plan.mlp_hc.weights(prompt_weights()),
+                                                 config.rms_norm_eps, *rank.workspace, mixed,
+                                                 &inject, rank.stream);
             }
             run_moe(plan, rank, t, i);
             pending = true;
@@ -4707,12 +4727,13 @@ struct Executor::Impl {
                     }
                     auto scope = rank.workspace->scope();
                     if (write_read) {
-                        ops::hyper_connection_write_read(stack, moe_out, inject,
-                                                         plan.attn_hc.weights(), config.rms_norm_eps,
-                                                         *rank.workspace, mixed, &inject, rank.stream);
+                        ops::hyper_connection_write_read(
+                            stack, moe_out, inject, plan.attn_hc.weights(prompt_weights()),
+                            config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
                     } else {
-                        ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
-                                                   *rank.workspace, mixed, &inject, rank.stream);
+                        ops::hyper_connection_read(stack, plan.attn_hc.weights(prompt_weights()),
+                                                   config.rms_norm_eps, *rank.workspace, mixed,
+                                                   &inject, rank.stream);
                     }
                 });
             }
@@ -4751,8 +4772,8 @@ struct Executor::Impl {
                     auto scope    = rank.workspace->scope();
                     ops::hyper_connection_write_read(
                         stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
-                        plan_of(r, i).mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
-                        &inject, rank.stream);
+                        plan_of(r, i).mlp_hc.weights(prompt_weights()), config.rms_norm_eps,
+                        *rank.workspace, mixed, &inject, rank.stream);
                 });
             }
             exchange_step(n, TensorParallelSum::StoreFp32,
@@ -4957,12 +4978,13 @@ struct Executor::Impl {
                                 if (pending) {
                                     ops::hyper_connection_write_read(
                                         stack, moe_out_of(rank, run), inject,
-                                        plan.attn_hc.weights(), config.rms_norm_eps,
+                                        plan.attn_hc.weights(prompt_weights()), config.rms_norm_eps,
                                         *rank.workspace, mixed, &inject, rank.stream);
                                 } else {
-                                    ops::hyper_connection_read(stack, plan.attn_hc.weights(),
-                                                               config.rms_norm_eps, *rank.workspace,
-                                                               mixed, &inject, rank.stream);
+                                    ops::hyper_connection_read(
+                                        stack, plan.attn_hc.weights(prompt_weights()),
+                                        config.rms_norm_eps, *rank.workspace, mixed, &inject,
+                                        rank.stream);
                                 }
                             }
                             run_mixer(
@@ -4998,13 +5020,14 @@ struct Executor::Impl {
                     {
                         auto scope = rank.workspace->scope();
                         if (write_read) {
-                            ops::hyper_connection_write_read(
-                                stack, moe_out_of(rank, run), inject, plan.attn_hc.weights(),
-                                config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
+                            ops::hyper_connection_write_read(stack, moe_out_of(rank, run), inject,
+                                                             plan.attn_hc.weights(prompt_weights()),
+                                                             config.rms_norm_eps, *rank.workspace,
+                                                             mixed, &inject, rank.stream);
                         } else {
-                            ops::hyper_connection_read(stack, plan.attn_hc.weights(),
-                                                       config.rms_norm_eps, *rank.workspace, mixed,
-                                                       &inject, rank.stream);
+                            ops::hyper_connection_read(
+                                stack, plan.attn_hc.weights(prompt_weights()), config.rms_norm_eps,
+                                *rank.workspace, mixed, &inject, rank.stream);
                         }
                     }
                     if (partial == nullptr) { return; }
@@ -5025,8 +5048,9 @@ struct Executor::Impl {
                                auto scope = rank.workspace->scope();
                                ops::hyper_connection_write_read(
                                    stack, mixer_out_of(rank, run), inject,
-                                   plan_of(r, i).mlp_hc.weights(), config.rms_norm_eps,
-                                   *rank.workspace, mixed, &inject, rank.stream);
+                                   plan_of(r, i).mlp_hc.weights(prompt_weights()),
+                                   config.rms_norm_eps, *rank.workspace, mixed, &inject,
+                                   rank.stream);
                            }
                            run_moe_share(plan_of(r, i), rank, i, partial, run);
                        });
@@ -5192,7 +5216,8 @@ struct Executor::Impl {
         const bool host_free = !stream || misses;
         // A K/V-only pass runs eagerly: the decode graphs end in the head.
         const bool decode_graph = options.cuda_graphs && t == 1 && host_free && !verifying &&
-                                  branch_origin == nullptr && !kv_only_pass;
+                                  branch_origin == nullptr && !kv_only_pass &&
+                                  !(config.hc_prefill_inject && prompt_pass);
         const bool verify_graph = options.cuda_graphs && verifying && parts.size() == 1 &&
                                   host_free && t <= kVectorTokens && branch_origin == nullptr;
         if (misses) { misses->keep_alive(); }
@@ -5747,7 +5772,7 @@ struct Executor::Impl {
                     if (plan.ple) { run_ple(plan, state, rank, part); }
                     {
                         auto scope = rank.workspace->scope();
-                        ops::hyper_connection_read(stack, plan.attn_hc.weights(),
+                        ops::hyper_connection_read(stack, plan.attn_hc.weights(true),
                                                    config.rms_norm_eps, *rank.workspace, mixed,
                                                    &inject, st);
                     }
@@ -5762,10 +5787,10 @@ struct Executor::Impl {
                     }
                     if (!kv_only) {
                         auto scope = rank.workspace->scope();
-                        ops::hyper_connection_write_read(
-                            stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
-                            plan.mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
-                            &inject, st);
+                        ops::hyper_connection_write_read(stack, Tensor(rank.y, DType::BF16, {h, t}),
+                                                         inject, plan.mlp_hc.weights(true),
+                                                         config.rms_norm_eps, *rank.workspace,
+                                                         mixed, &inject, st);
                     }
                     // The layer's state at the cut, before the next chunk moves it on.
                     if (cut.state != nullptr && k + 1 == cut.chunk) {
@@ -6622,12 +6647,12 @@ struct Executor::Impl {
         embed_cells(ids, n, rank.mixed, media);
         Tensor embedded(rank.mixed, DType::BF16, {h, n});
         Tensor embedded_norm(rank.d, DType::BF16, {h, n});
-        ops::rmsnorm(embedded, mtp->embedding_norm, eps, true, embedded_norm, s);
+        ops::rmsnorm(embedded, mtp->embedding_norm, eps, config.norm_unit_offset, embedded_norm, s);
         Tensor token(rank.e, DType::BF16, {h, n});
         project(mtp->fc_embedding, embedded_norm, token, ws, s);
         Tensor hidden(rank.a, DType::BF16, {hc * h, n});
         Tensor hidden_norm(rank.b, DType::BF16, {hc * h, n});
-        ops::rmsnorm(hidden, mtp->hidden_norm, eps, true, hidden_norm, s);
+        ops::rmsnorm(hidden, mtp->hidden_norm, eps, config.norm_unit_offset, hidden_norm, s);
         Tensor streams(rank.c, DType::BF16, {h, hc * n});
         project(mtp->fc_hidden, Tensor(rank.b, DType::BF16, {h, hc * n}), streams, ws, s);
         Tensor stack(rank.stack, DType::FP32, {h, hc, n});
@@ -6638,7 +6663,8 @@ struct Executor::Impl {
         Tensor inject(rank.inject, DType::FP32, {hc, n});
         {
             auto scope = ws.scope();
-            ops::hyper_connection_read(stack, plan.attn_hc.weights(), eps, ws, mixed, &inject, s);
+            ops::hyper_connection_read(stack, plan.attn_hc.weights(!drafting), eps, ws, mixed,
+                                       &inject, s);
         }
         // The target pass's rotation state, which the cells' replaces until their attention ends.
         const bool target_axes          = std::exchange(mrope, axes);
@@ -6672,7 +6698,8 @@ struct Executor::Impl {
         {
             auto scope = ws.scope();
             ops::hyper_connection_write_read(stack, Tensor(rank.y, DType::BF16, {h, n}), inject,
-                                             plan.mlp_hc.weights(), eps, ws, mixed, &inject, s);
+                                             plan.mlp_hc.weights(!drafting), eps, ws, mixed,
+                                             &inject, s);
         }
         if (drafting) {
             run_moe(plan, rank, n, layers.size());
@@ -7238,7 +7265,8 @@ struct Executor::Impl {
                               {di, static_cast<std::int32_t>(pooled_slots)});
                 Tensor tail(state.tail.p, DType::FP32,
                             {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
-                const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+                const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm,
+                                                config.norm_unit_offset};
                 ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps,
                                         options.rope_yarn, pooled, tail, rank.stream);
             }

@@ -54,13 +54,25 @@ TextConfig parse_text_config(const Json& value) {
          "shared_expert_intermediate_size", "hc_count", "hc_lowrank", "ple_layers",
          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed"},
-        {"latent_moe"}, "Qwen4Exp text config");
+        {"latent_moe", "fp32_direct", "norm_unit_offset", "hc_prefill_inject", "gdn_a_is_log"},
+        "Qwen4Exp text config");
     const auto& architectures = value.at("architectures");
     if (!architectures.is_array() || architectures.size() != 1 ||
         architectures[0] != "Qwen4ExpForCausalLM" || value.at("model_type") != "qwen4_exp_text") {
         throw ArtifactError("Qwen4Exp text config: architecture/model_type mismatch");
     }
     TextConfig out;
+    const auto boolean = [&](const char* name, bool fallback) {
+        if (!value.contains(name)) { return fallback; }
+        if (!value.at(name).is_boolean()) {
+            throw ArtifactError(std::string(name) + " must be boolean");
+        }
+        return value.at(name).get<bool>();
+    };
+    out.fp32_direct             = boolean("fp32_direct", false);
+    out.norm_unit_offset        = boolean("norm_unit_offset", true);
+    out.hc_prefill_inject       = boolean("hc_prefill_inject", false);
+    out.gdn_a_is_log            = boolean("gdn_a_is_log", true);
     out.hidden_size             = integer(value, "hidden_size");
     out.vocab_size              = integer(value, "vocab_size");
     out.num_hidden_layers       = integer(value, "num_hidden_layers");

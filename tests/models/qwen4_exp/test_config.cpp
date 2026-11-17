@@ -50,6 +50,22 @@ int run() {
     require(config.ngram_heads() == 16, "16 n-gram heads");
     const NgramHashConstants constants = derive_ngram_hash_constants(config.ngram);
     require(constants.rows == 320001536ULL, "n-gram table rows");
+    require(!config.fp32_direct && config.norm_unit_offset && !config.hc_prefill_inject &&
+                config.gdn_a_is_log,
+            "existing artifacts retain their weight conventions");
+    Json basalt                 = fixture();
+    basalt["fp32_direct"]       = true;
+    basalt["norm_unit_offset"]  = false;
+    basalt["hc_prefill_inject"] = true;
+    basalt["gdn_a_is_log"]      = false;
+    const auto preserved        = parse_text_config(basalt);
+    require(preserved.fp32_direct && !preserved.norm_unit_offset && preserved.hc_prefill_inject &&
+                !preserved.gdn_a_is_log,
+            "Basalt's stored weight conventions parse");
+    for (const char* field :
+         {"fp32_direct", "norm_unit_offset", "hc_prefill_inject", "gdn_a_is_log"}) {
+        expect_refusal([&](Json& c) { c[field] = 1; }, std::string(field) + " must be boolean");
+    }
 
     // A 3..5 source slice starts at a QSA block and contains no PLE. Local layer numbers
     // describe this stack; they do not imply the full checkpoint's every-fourth phase.
